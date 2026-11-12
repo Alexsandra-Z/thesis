@@ -1,0 +1,1691 @@
+# 1. Импорт библиотек
+
+import warnings
+warnings.filterwarnings('ignore')
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.api import VAR
+
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, median_absolute_error
+
+plt.rcParams['figure.figsize'] = (12, 5)
+plt.rcParams['axes.grid'] = True
+sns.set_style('whitegrid')
+
+# 2. Загрузка данных
+
+FILE_PATH = '/content/drive/MyDrive/data.csv'
+
+raw = pd.read_csv(
+    FILE_PATH,
+    sep=';',
+    encoding='cp1251',
+    dtype=str
+)
+
+raw = raw.dropna(how='all').copy()
+raw.columns = raw.columns.str.strip()
+
+print('Размер таблицы:', raw.shape)
+display(raw.head())
+print(raw.columns.tolist())
+
+# 3. Переименование и очистка
+
+raw.columns = raw.columns.str.strip()
+
+column_map = {
+    'Дата': 'date',
+
+    'Средняя стоимость 1 квадратного метра, руб.': 'price_sqm',
+    'Индекс цен на первичном рынке, эконом/комфорт-класс': 'price_index_economy',
+    'Индекс цен на первичном рынке, бизнес-класс': 'price_index_business',
+
+    'Проданная площадь, тыс. кв. м': 'sold_area',
+    'Непроданная площадь, тыс. кв. м': 'unsold_area',
+    'Площадь, по которой продажи не открыты, тыс. кв. м': 'closed_sales_area',
+    'Ввод многоквартирных домов, тыс. кв. м': 'housing_completion',
+
+    'Объем ипотечных жилищных кредитов, млн руб.': 'mortgage_volume',
+    'Средневзвешенная ставка по кредиту на квартиру, %': 'mortgage_rate',
+
+    'Ключевая ставка Банка России, % годовых': 'key_rate',
+    'Инфляция, % год к году': 'inflation_yoy'
+}
+
+df = raw.rename(columns=column_map).copy()
+
+df['date'] = pd.to_datetime(df['date'], errors='coerce')
+
+for col in df.columns:
+    if col != 'date':
+        df[col] = (
+            df[col]
+            .astype(str)
+            .str.replace(' ', '', regex=False)
+            .str.replace('\xa0', '', regex=False)
+            .str.replace(',', '.', regex=False)
+        )
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+df = df.dropna(subset=['date']).copy()
+df = df.sort_values('date').reset_index(drop=True)
+df = df.set_index('date')
+
+print('размер после очистки:', df.shape)
+display(df.head())
+display(df.tail())
+
+# 4. Списки переменных
+
+targets = [
+    'price_sqm',
+    'price_index_economy',
+    'price_index_business'
+]
+
+base_exog_cols = [
+    'sold_area',
+    'unsold_area',
+    'closed_sales_area',
+    'housing_completion',
+    'mortgage_volume',
+    'mortgage_rate',
+    'key_rate',
+    'inflation_yoy'
+]
+
+df = df[targets + base_exog_cols].copy()
+
+# 5 Производные признаки
+
+df_feat = df.copy()
+
+df_feat['total_area'] = (
+    df_feat['sold_area'] +
+    df_feat['unsold_area'] +
+    df_feat['closed_sales_area']
+)
+
+df_feat['sold_share'] = df_feat['sold_area'] / df_feat['total_area']
+df_feat['unsold_share'] = df_feat['unsold_area'] / df_feat['total_area']
+df_feat['closed_share'] = df_feat['closed_sales_area'] / df_feat['total_area']
+
+df_feat['mortgage_volume_growth'] = df_feat['mortgage_volume'].pct_change()
+df_feat['log_mortgage_volume'] = np.log(df_feat['mortgage_volume'])
+
+df_feat['housing_completion_growth'] = df_feat['housing_completion'].pct_change()
+
+display(df_feat.head())
+
+# 6 Спецификации факторов
+
+specs = {
+    'macro_raw': [
+        'mortgage_volume',
+        'mortgage_rate',
+        'key_rate',
+        'inflation_yoy'
+    ],
+
+    'market_raw': [
+        'sold_area',
+        'unsold_area',
+        'closed_sales_area',
+        'housing_completion'
+    ],
+
+    'mixed_raw': [
+        'mortgage_volume',
+        'sold_area',
+        'housing_completion',
+        'mortgage_rate',
+        'inflation_yoy'
+    ],
+
+    'macro_derived': [
+        'log_mortgage_volume',
+        'mortgage_volume_growth',
+        'mortgage_rate',
+        'key_rate',
+        'inflation_yoy'
+    ],
+
+    'market_derived': [
+        'sold_share',
+        'unsold_share',
+        'closed_share',
+        'housing_completion_growth'
+    ],
+
+    'mixed_derived': [
+        'log_mortgage_volume',
+        'sold_share',
+        'housing_completion_growth',
+        'mortgage_rate',
+        'inflation_yoy'
+    ]
+}
+
+for name, cols in specs.items():
+    print(name, ':', cols)
+
+# 7 Версии данных: уровни и приросты
+
+df_level = df_feat.copy()
+
+df_growth = df_feat.copy()
+
+for col in targets:
+    df_growth[col] = np.log(df_growth[col]).diff()
+
+df_growth = df_growth.replace([np.inf, -np.inf], np.nan)
+df_growth = df_growth.dropna().copy()
+
+data_versions = {
+    'level': df_level,
+    'growth': df_growth
+}
+
+print('Level:', df_level.shape)
+print('Growth:', df_growth.shape)
+
+# 8 Первичный анализ
+
+all_plot_cols = targets + base_exog_cols
+
+for col in all_plot_cols:
+    plt.figure(figsize=(12, 4))
+    plt.plot(df.index, df[col])
+    plt.title(f'ряд {col}')
+    plt.xlabel('дата')
+    plt.ylabel(col)
+    plt.show()
+
+plt.figure(figsize=(10, 7))
+sns.heatmap(
+    df[targets + base_exog_cols].corr(),
+    annot=True,
+    fmt='.2f',
+    cmap='coolwarm'
+)
+plt.title('корреляционная матрица')
+plt.show()
+
+# корреляционные матрицы сырых и производных показателей
+
+raw_corr_cols = targets + base_exog_cols
+
+derived_corr_cols = targets + [
+    'total_area',
+    'sold_share',
+    'unsold_share',
+    'closed_share',
+    'mortgage_volume_growth',
+    'log_mortgage_volume',
+    'housing_completion_growth',
+    'mortgage_rate',
+    'key_rate',
+    'inflation_yoy'
+]
+
+labels_ru = {
+    'price_sqm': 'Средняя стоимость 1 кв. м',
+    'price_index_economy': 'Индекс эконом/комфорт-класса',
+    'price_index_business': 'Индекс бизнес-класса',
+
+    'sold_area': 'Проданная площадь',
+    'unsold_area': 'Непроданная площадь',
+    'closed_sales_area': 'Площадь без открытых продаж',
+    'housing_completion': 'Ввод жилья',
+
+    'mortgage_volume': 'Объем ипотеки',
+    'mortgage_rate': 'Ставка по ипотеке',
+    'key_rate': 'Ключевая ставка',
+    'inflation_yoy': 'Инфляция г/г',
+
+    'total_area': 'Общий объем предложения',
+    'sold_share': 'Доля проданной площади',
+    'unsold_share': 'Доля непроданной площади',
+    'closed_share': 'Доля площади без продаж',
+    'mortgage_volume_growth': 'Прирост объема ипотеки',
+    'log_mortgage_volume': 'Логарифм объема ипотеки',
+    'housing_completion_growth': 'Прирост ввода жилья'
+}
+
+
+def plot_corr_matrix(data, cols, title):
+    corr_data = data[cols].copy()
+    corr_data = corr_data.rename(columns=labels_ru)
+
+    plt.figure(figsize=(13, 10))
+
+    sns.heatmap(
+        corr_data.corr(),
+        annot=True,
+        fmt='.2f',
+        cmap='coolwarm',
+        square=True,
+        linewidths=0.5
+    )
+
+    plt.title(title)
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.show()
+
+
+plot_corr_matrix(
+    data=df_feat,
+    cols=raw_corr_cols,
+    title='Корреляционная матрица сырых показателей'
+)
+
+plot_corr_matrix(
+    data=df_feat,
+    cols=derived_corr_cols,
+    title='Корреляционная матрица производных показателей'
+)
+
+# 9. ADF-тест
+
+def adf_test(series, name):
+    series = series.dropna()
+    result = adfuller(series, autolag='AIC')
+
+    return {
+        'series': name,
+        'adf_stat': result[0],
+        'p_value': result[1],
+        'lags_used': result[2],
+        'n_obs': result[3]
+    }
+
+adf_level = pd.DataFrame([
+    adf_test(df_level[col], col) for col in targets
+])
+
+adf_growth = pd.DataFrame([
+    adf_test(df_growth[col], col) for col in targets
+])
+
+print('ADF для уровней:')
+display(adf_level)
+
+print('ADF для лог-приростов:')
+display(adf_growth)
+
+# первая разность ценовых показателей
+
+price_diff = pd.DataFrame(index=df.index)
+
+for target in targets:
+    price_diff[target] = df[target].diff()
+
+display(price_diff.head(15))
+
+for target in targets:
+    series = price_diff[target].dropna()
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(series.index, series.values)
+    plt.title(f'первая разность ряда {target}')
+    plt.xlabel('дата')
+    plt.ylabel('изменение за месяц')
+    plt.show()
+
+# сезонность первой разности по месяцам
+
+for target in targets:
+    temp = price_diff[[target]].dropna().copy()
+    temp['month'] = temp.index.month
+
+    plt.figure(figsize=(10, 4))
+    sns.boxplot(data=temp, x='month', y=target)
+    plt.title(f'распределение месячных изменений по месяцам: {target}')
+    plt.xlabel('месяц')
+    plt.ylabel('первая разность')
+    plt.show()
+
+# автокорреляция первой разности
+
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+
+for target in targets:
+    series = price_diff[target].dropna()
+
+    plt.figure(figsize=(12, 4))
+    plot_acf(series, lags=24)
+    plt.title(f'ACF первой разности: {target}')
+    plt.show()
+
+    plt.figure(figsize=(12, 4))
+    plot_pacf(series, lags=24, method='ywm')
+    plt.title(f'PACF первой разности: {target}')
+    plt.show()
+
+# сравнение ARIMA и SARIMA по AIC и BIC
+
+arima_sarima_compare = []
+
+for target in targets:
+    series = df[target].dropna()
+
+    try:
+        arima_model = SARIMAX(
+            series,
+            order=(1, 1, 0),
+            seasonal_order=(0, 0, 0, 12),
+            enforce_stationarity=False,
+            enforce_invertibility=False
+        ).fit(disp=False)
+
+        sarima_model = SARIMAX(
+            series,
+            order=(1, 1, 0),
+            seasonal_order=(1, 0, 0, 12),
+            enforce_stationarity=False,
+            enforce_invertibility=False
+        ).fit(disp=False)
+
+        arima_sarima_compare.append({
+            'target': target,
+            'model': 'ARIMA',
+            'order': '(1, 1, 0)',
+            'seasonal_order': '-',
+            'AIC': arima_model.aic,
+            'BIC': arima_model.bic
+        })
+
+        arima_sarima_compare.append({
+            'target': target,
+            'model': 'SARIMA',
+            'order': '(1, 1, 0)',
+            'seasonal_order': '(1, 0, 0, 12)',
+            'AIC': sarima_model.aic,
+            'BIC': sarima_model.bic
+        })
+
+    except Exception as e:
+        print(f'{target}: модель не построилась — {e}')
+
+arima_sarima_compare_df = pd.DataFrame(arima_sarima_compare)
+
+display(
+    arima_sarima_compare_df.sort_values(
+        ['target', 'AIC']
+    ).reset_index(drop=True)
+)
+
+# краткий вывод по сравнению ARIMA и SARIMA
+
+for target in targets:
+    temp = arima_sarima_compare_df[
+        arima_sarima_compare_df['target'] == target
+    ].copy()
+
+    if temp.empty:
+        continue
+
+    best_aic = temp.sort_values('AIC').iloc[0]
+    best_bic = temp.sort_values('BIC').iloc[0]
+
+    print(f'{target}:')
+    print(f"лучшая модель по AIC: {best_aic['model']}")
+    print(f"лучшая модель по BIC: {best_bic['model']}")
+    print()
+
+# 10. Метрики
+
+def smape(y_true, y_pred):
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    denom = (np.abs(y_true) + np.abs(y_pred)) / 2
+    value = np.where(denom == 0, 0, np.abs(y_true - y_pred) / denom)
+
+    return np.mean(value) * 100
+
+
+def evaluate_model(y_true, y_pred):
+    y_true = pd.Series(y_true).reset_index(drop=True)
+    y_pred = pd.Series(y_pred).reset_index(drop=True)
+
+    return {
+        'MAE': mean_absolute_error(y_true, y_pred),
+        'RMSE': np.sqrt(mean_squared_error(y_true, y_pred)),
+        'SMAPE': smape(y_true, y_pred),
+        'MedAE': median_absolute_error(y_true, y_pred)
+    }
+
+# 11.baseline-модели
+
+def naive_forecast_horizon(series, horizon=1, test_size=12):
+    train_size = len(series) - test_size
+    preds = []
+    dates = []
+
+    for target_pos in range(train_size, len(series)):
+        origin_pos = target_pos - horizon
+        pred = series.iloc[origin_pos]
+
+        preds.append(pred)
+        dates.append(series.index[target_pos])
+
+    return pd.Series(preds, index=dates)
+
+
+def seasonal_naive_forecast_horizon(series, horizon=1, test_size=12, season=12):
+    train_size = len(series) - test_size
+    preds = []
+    dates = []
+
+    for target_pos in range(train_size, len(series)):
+        seasonal_pos = target_pos - season
+
+        if seasonal_pos >= 0:
+            pred = series.iloc[seasonal_pos]
+        else:
+            pred = series.iloc[target_pos - horizon]
+
+        preds.append(pred)
+        dates.append(series.index[target_pos])
+
+    return pd.Series(preds, index=dates)
+
+
+def drift_naive_forecast_horizon(series, horizon=1, test_size=12):
+    train_size = len(series) - test_size
+    preds = []
+    dates = []
+
+    for target_pos in range(train_size, len(series)):
+        origin_pos = target_pos - horizon
+        history = series.iloc[:origin_pos + 1]
+
+        mean_change = history.diff().dropna().mean()
+        pred = history.iloc[-1] + horizon * mean_change
+
+        preds.append(pred)
+        dates.append(series.index[target_pos])
+
+    return pd.Series(preds, index=dates)
+
+
+def seasonal_drift_naive_forecast_horizon(series, horizon=1, test_size=12, season=12):
+    train_size = len(series) - test_size
+    preds = []
+    dates = []
+
+    for target_pos in range(train_size, len(series)):
+        origin_pos = target_pos - horizon
+
+        seasonal_pos = target_pos - season
+        origin_seasonal_pos = origin_pos - season
+
+        if seasonal_pos >= 0 and origin_seasonal_pos >= 0:
+            seasonal_value = series.iloc[seasonal_pos]
+            level_shift = series.iloc[origin_pos] - series.iloc[origin_seasonal_pos]
+            pred = seasonal_value + level_shift
+        else:
+            pred = series.iloc[origin_pos]
+
+        preds.append(pred)
+        dates.append(series.index[target_pos])
+
+    return pd.Series(preds, index=dates)
+
+
+baseline_models = {
+    'naive': naive_forecast_horizon,
+    'seasonal_naive': seasonal_naive_forecast_horizon,
+    'drift_naive': drift_naive_forecast_horizon,
+    'seasonal_drift_naive': seasonal_drift_naive_forecast_horizon
+}
+
+
+def evaluate_baseline_model(series, model_func, test_size=12, horizons=[1, 2, 3]):
+    horizon_results = []
+    horizon_forecasts = {}
+
+    for horizon in horizons:
+        pred = model_func(
+            series,
+            horizon=horizon,
+            test_size=test_size
+        )
+
+        y_true = series.loc[pred.index]
+        metrics = evaluate_model(y_true, pred)
+
+        horizon_results.append(metrics)
+        horizon_forecasts[horizon] = pred
+
+    avg_metrics = pd.DataFrame(horizon_results).mean().to_dict()
+
+    return avg_metrics, horizon_forecasts
+
+# 12. SARIMA walk-forward
+
+def fit_sarima(history, data_version):
+    if data_version == 'level':
+        order = (1, 1, 0)
+        seasonal_order = (1, 0, 0, 12)
+    else:
+        order = (1, 0, 0)
+        seasonal_order = (1, 0, 0, 12)
+
+    model = SARIMAX(
+        history,
+        order=order,
+        seasonal_order=seasonal_order,
+        enforce_stationarity=False,
+        enforce_invertibility=False
+    )
+
+    return model.fit(disp=False)
+
+
+def sarima_walk_forward(series, data_version, test_size=12):
+    train_size = len(series) - test_size
+    history = series.iloc[:train_size].copy()
+    test = series.iloc[train_size:].copy()
+
+    preds = []
+
+    for date in test.index:
+        model_fit = fit_sarima(history, data_version)
+        pred = model_fit.forecast(steps=1).iloc[0]
+
+        preds.append(pred)
+        history.loc[date] = test.loc[date]
+
+    return pd.Series(preds, index=test.index)
+
+# 13 VAR walk-forward
+
+var_targets = [
+    'price_index_economy',
+    'price_index_business'
+]
+
+
+def var_walk_forward(model_data, target_cols, test_size=12, maxlags=2):
+    model_data = model_data[target_cols].dropna().copy()
+
+    train_size = len(model_data) - test_size
+    history = model_data.iloc[:train_size].copy()
+    test = model_data.iloc[train_size:].copy()
+
+    preds = []
+
+    for date in test.index:
+        lag = min(maxlags, max(1, len(history) // 10))
+
+        model = VAR(history)
+        model_fit = model.fit(lag)
+
+        forecast = model_fit.forecast(
+            history.values[-lag:],
+            steps=1
+        )[0]
+
+        preds.append(forecast)
+
+        history = pd.concat([history, test.loc[[date]]])
+
+    preds = pd.DataFrame(
+        preds,
+        index=test.index,
+        columns=target_cols
+    )
+
+    return preds
+
+# 14 Ridge walk-forward
+
+def make_ridge_train_features(train_data, target, features):
+    train_frame = train_data[[target] + features].copy()
+
+    train_frame[f'{target}_lag_1'] = train_frame[target].shift(1)
+    train_frame[f'{target}_lag_12'] = train_frame[target].shift(12)
+
+    return train_frame.dropna()
+
+
+def ridge_walk_forward(model_data, target, features, test_size=12):
+    model_data = model_data[[target] + features].dropna().copy()
+
+    train_size = len(model_data) - test_size
+    preds = []
+
+    for i in range(train_size, len(model_data)):
+        train_data = model_data.iloc[:i].copy()
+        test_row = model_data.iloc[i:i+1].copy()
+
+        train_features = make_ridge_train_features(
+            train_data,
+            target,
+            features
+        )
+
+        X_train = train_features.drop(columns=[target])
+        y_train = train_features[target]
+
+        test_features = {}
+
+        for col in features:
+            test_features[col] = test_row[col].iloc[0]
+
+        test_features[f'{target}_lag_1'] = train_data[target].iloc[-1]
+        test_features[f'{target}_lag_12'] = train_data[target].iloc[-12]
+
+        X_test = pd.DataFrame([test_features], index=test_row.index)
+        X_test = X_test[X_train.columns]
+
+        scaler = StandardScaler()
+
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+
+        model = Ridge(alpha=1.0)
+        model.fit(X_train_scaled, y_train)
+
+        pred = model.predict(X_test_scaled)[0]
+        preds.append(pred)
+
+    return pd.Series(preds, index=model_data.index[train_size:])
+
+# 15 запуск всех моделей
+
+TEST_SIZE = 12
+
+results = []
+forecasts = {}
+
+for data_version, data in data_versions.items():
+    print('=' * 80)
+    print(f'версия данных: {data_version}')
+    print('=' * 80)
+
+    # SARIMA и baseline для всех target
+    for target in targets:
+        series = data[target].dropna()
+        test_series = series.iloc[-TEST_SIZE:]
+
+        # baseline-модели
+        for baseline_name, baseline_func in baseline_models.items():
+            metrics, horizon_forecasts = evaluate_baseline_model(
+                series=series,
+                model_func=baseline_func,
+                test_size=TEST_SIZE,
+                horizons=[1, 2, 3]
+            )
+
+            results.append({
+                'target': target,
+                'model': baseline_name,
+                'specification': '-',
+                'data_version': data_version,
+                **metrics
+            })
+
+            # для графиков сохраняем прогноз на 1 месяц вперед
+            forecasts[(target, baseline_name, '-', data_version)] = horizon_forecasts[1]
+
+        # SARIMA
+        try:
+            pred_sarima = sarima_walk_forward(series, data_version, TEST_SIZE)
+            metrics = evaluate_model(test_series, pred_sarima)
+
+            results.append({
+                'target': target,
+                'model': 'SARIMA',
+                'specification': '-',
+                'data_version': data_version,
+                **metrics
+            })
+
+            forecasts[(target, 'SARIMA', '-', data_version)] = pred_sarima
+
+        except Exception as e:
+            print(f'{target}, {data_version}: SARIMA не построилась — {e}')
+
+    # VAR только для индексов
+    try:
+        var_data = data[var_targets].dropna()
+
+        if len(var_data) > TEST_SIZE + 20:
+            pred_var = var_walk_forward(var_data, var_targets, TEST_SIZE)
+
+            for target in var_targets:
+                test_series = var_data[target].iloc[-TEST_SIZE:]
+                metrics = evaluate_model(test_series, pred_var[target])
+
+                results.append({
+                    'target': target,
+                    'model': 'VAR',
+                    'specification': '-',
+                    'data_version': data_version,
+                    **metrics
+                })
+
+                forecasts[(target, 'VAR', '-', data_version)] = pred_var[target]
+
+    except Exception as e:
+        print(f'VAR, {data_version}: модель не построилась — {e}')
+
+    # Ridge по спецификациям
+    for target in targets:
+        for spec_name, feature_list in specs.items():
+            available_features = [
+                col for col in feature_list
+                if col in data.columns
+            ]
+
+            if len(available_features) == 0:
+                continue
+
+            try:
+                pred_ridge = ridge_walk_forward(
+                    model_data=data,
+                    target=target,
+                    features=available_features,
+                    test_size=TEST_SIZE
+                )
+
+                ridge_data = data[[target] + available_features].dropna().copy()
+                test_series = ridge_data[target].iloc[-TEST_SIZE:]
+
+                metrics = evaluate_model(test_series, pred_ridge)
+
+                results.append({
+                    'target': target,
+                    'model': 'Ridge',
+                    'specification': spec_name,
+                    'data_version': data_version,
+                    **metrics
+                })
+
+                forecasts[(target, 'Ridge', spec_name, data_version)] = pred_ridge
+
+            except Exception as e:
+                print(f'{target}, {data_version}, {spec_name}: Ridge не построилась — {e}')
+
+# 16 итоговая таблица всех результатов
+final_results = pd.DataFrame(results)
+
+final_results = final_results[
+    [
+        'target',
+        'model',
+        'specification',
+        'data_version',
+        'MAE',
+        'RMSE',
+        'SMAPE',
+        'MedAE'
+    ]
+]
+
+final_results = final_results.sort_values(
+    ['target', 'data_version', 'RMSE']
+).reset_index(drop=True)
+
+display(final_results)
+
+# 17 Разделение результатов level и growth
+
+final_results_level = final_results[
+    final_results['data_version'] == 'level'
+].copy()
+
+final_results_growth = final_results[
+    final_results['data_version'] == 'growth'
+].copy()
+
+final_results_level = final_results_level.sort_values(
+    ['target', 'RMSE']
+).reset_index(drop=True)
+
+final_results_growth = final_results_growth.sort_values(
+    ['target', 'RMSE']
+).reset_index(drop=True)
+
+print('Результаты моделей в уровнях:')
+display(final_results_level)
+
+print('Результаты моделей на приростах:')
+display(final_results_growth)
+
+# 18 Лучшие модели отдельно для level и growth
+best_models_level = (
+    final_results_level
+    .sort_values(['target', 'RMSE'])
+    .groupby('target')
+    .head(1)
+    .reset_index(drop=True)
+)
+
+best_models_growth = (
+    final_results_growth
+    .sort_values(['target', 'RMSE'])
+    .groupby('target')
+    .head(1)
+    .reset_index(drop=True)
+)
+
+print('Лучшие модели в уровнях:')
+display(best_models_level)
+
+print('Лучшие модели на приростах:')
+display(best_models_growth)
+
+# 19. Таблица
+
+predefense_results = final_results_level[
+    [
+        'target',
+        'model',
+        'specification',
+        'MAE',
+        'RMSE',
+        'SMAPE',
+        'MedAE'
+    ]
+].copy()
+
+predefense_results = predefense_results.sort_values(
+    ['target', 'RMSE']
+).reset_index(drop=True)
+
+print('Компактная таблица моделей в уровнях для предзащиты:')
+display(predefense_results)
+
+print('Лучшие модели в уровнях для предзащиты:')
+display(best_models_level)
+
+# 20 Графики лучших моделей в уровнях
+
+for _, row in best_models_level.iterrows():
+    target = row['target']
+    model_name = row['model']
+    spec_name = row['specification']
+    data_version = 'level'
+
+    data = data_versions[data_version]
+    series = data[target].dropna()
+
+    train_series = series.iloc[:-TEST_SIZE]
+    test_series = series.iloc[-TEST_SIZE:]
+
+    key = (target, model_name, spec_name, data_version)
+
+    if key not in forecasts:
+        print(f'Прогноз не найден: {key}')
+        continue
+
+    pred = forecasts[key]
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(train_series.index, train_series.values, label='train')
+    plt.plot(test_series.index, test_series.values, label='test')
+    plt.plot(pred.index, pred.values, label='forecast')
+
+    plt.title(f'{target}: прогноз модели {model_name}, спецификация {spec_name}')
+    plt.xlabel('Дата')
+    plt.ylabel(target)
+    plt.legend()
+    plt.show()
+
+    errors = test_series - pred
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(errors.index, errors.values)
+    plt.axhline(0, linestyle='--')
+    plt.title(f'{target}: ошибки прогноза модели {model_name}')
+    plt.xlabel('Дата')
+    plt.ylabel('Ошибка')
+    plt.show()
+
+# 21. Ошибки по месяцам для лучших моделей level
+
+monthly_errors_level = []
+
+for _, row in best_models_level.iterrows():
+    target = row['target']
+    model_name = row['model']
+    spec_name = row['specification']
+    data_version = 'level'
+
+    data = data_versions[data_version]
+    series = data[target].dropna()
+    test_series = series.iloc[-TEST_SIZE:]
+
+    key = (target, model_name, spec_name, data_version)
+
+    if key not in forecasts:
+        continue
+
+    pred = forecasts[key]
+
+    temp = pd.DataFrame({
+        'date': test_series.index,
+        'target': target,
+        'model': model_name,
+        'specification': spec_name,
+        'data_version': data_version,
+        'actual': test_series.values,
+        'forecast': pred.values
+    })
+
+    temp['error'] = temp['actual'] - temp['forecast']
+    temp['abs_error'] = temp['error'].abs()
+
+    monthly_errors_level.append(temp)
+
+monthly_errors_level_df = pd.concat(monthly_errors_level, ignore_index=True)
+
+display(monthly_errors_level_df)
+
+# 22 экспорта результатов
+
+# final_results_growth, best_models_level, monthly_errors_level_df.
+
+import os
+import pandas as pd
+
+os.makedirs("data", exist_ok=True)
+
+final_results_level.to_csv("data/final_model_results_level.csv", index=False)
+final_results_growth.to_csv("data/final_model_results_growth.csv", index=False)
+best_models_level.to_csv("data/best_models_level.csv", index=False)
+monthly_errors_level_df.to_csv("data/monthly_errors_level.csv", index=False)
+
+forecast_rows = []
+
+try:
+    for key, pred in forecasts.items():
+        target, model, specification, data_version = key
+        data = data_versions[data_version]
+        series = data[target].dropna()
+
+        train_series = series.iloc[:-TEST_SIZE]
+        test_series = series.iloc[-TEST_SIZE:]
+
+        for date, value in train_series.items():
+            forecast_rows.append({
+                "date": date,
+                "target": target,
+                "model": model,
+                "specification": specification,
+                "data_version": data_version,
+                "split": "train",
+                "value": value,
+            })
+
+        for date, value in test_series.items():
+            forecast_rows.append({
+                "date": date,
+                "target": target,
+                "model": model,
+                "specification": specification,
+                "data_version": data_version,
+                "split": "test",
+                "value": value,
+            })
+
+        for date, value in pred.items():
+            forecast_rows.append({
+                "date": date,
+                "target": target,
+                "model": model,
+                "specification": specification,
+                "data_version": data_version,
+                "split": "forecast",
+                "value": value,
+            })
+
+    forecasts_df = pd.DataFrame(forecast_rows)
+    forecasts_df.to_csv("data/forecasts.csv", index=False)
+    print("forecasts.csv сохранен")
+
+except Exception as e:
+    print("forecasts.csv не создан:", e)
+
+# 23. Прогнозы на 1-3 месяца вперед
+
+HORIZONS = [1, 2, 3]
+MULTI_TEST_SIZE = 12
+
+multi_horizon_results = []
+multi_horizon_forecasts = {}
+
+
+def naive_horizon_forecast(series, test_size=12, horizon=1):
+    series = series.dropna().copy()
+    train_size = len(series) - test_size
+
+    preds = []
+    pred_index = []
+
+    for i in range(train_size, len(series) - horizon + 1):
+        history = series.iloc[:i]
+        true_date = series.index[i + horizon - 1]
+
+        preds.append(history.iloc[-1])
+        pred_index.append(true_date)
+
+    return pd.Series(preds, index=pred_index)
+
+
+def seasonal_naive_horizon_forecast(series, test_size=12, season=12, horizon=1):
+    series = series.dropna().copy()
+    train_size = len(series) - test_size
+
+    preds = []
+    pred_index = []
+
+    for i in range(train_size, len(series) - horizon + 1):
+        true_pos = i + horizon - 1
+        true_date = series.index[true_pos]
+        seasonal_pos = true_pos - season
+
+        if seasonal_pos >= 0 and seasonal_pos < i:
+            pred = series.iloc[seasonal_pos]
+        else:
+            pred = series.iloc[i - 1]
+
+        preds.append(pred)
+        pred_index.append(true_date)
+
+    return pd.Series(preds, index=pred_index)
+
+
+def sarima_walk_forward_horizon(series, data_version, test_size=12, horizon=1):
+    series = series.dropna().copy()
+    train_size = len(series) - test_size
+
+    preds = []
+    pred_index = []
+
+    for i in range(train_size, len(series) - horizon + 1):
+        history = series.iloc[:i].copy()
+        true_date = series.index[i + horizon - 1]
+
+        model_fit = fit_sarima(history, data_version)
+        forecast = model_fit.forecast(steps=horizon)
+
+        preds.append(forecast.iloc[-1])
+        pred_index.append(true_date)
+
+    return pd.Series(preds, index=pred_index)
+
+
+def var_walk_forward_horizon(model_data, target_cols, test_size=12, maxlags=2, horizon=1):
+    model_data = model_data[target_cols].dropna().copy()
+    train_size = len(model_data) - test_size
+
+    preds = []
+    pred_index = []
+
+    for i in range(train_size, len(model_data) - horizon + 1):
+        history = model_data.iloc[:i].copy()
+        true_date = model_data.index[i + horizon - 1]
+
+        lag = min(maxlags, max(1, len(history) // 10))
+        model = VAR(history)
+        model_fit = model.fit(lag)
+
+        forecast = model_fit.forecast(
+            history.values[-lag:],
+            steps=horizon
+        )[-1]
+
+        preds.append(forecast)
+        pred_index.append(true_date)
+
+    return pd.DataFrame(
+        preds,
+        index=pred_index,
+        columns=target_cols
+    )
+
+
+def make_ridge_train_features_horizon(train_data, target, features, horizon):
+    train_frame = train_data[[target] + features].copy()
+
+    train_frame[f'{target}_lag_1'] = train_frame[target].shift(1)
+    train_frame[f'{target}_lag_12'] = train_frame[target].shift(12)
+    train_frame['target_future'] = train_frame[target].shift(-horizon)
+
+    return train_frame.dropna()
+
+
+def ridge_walk_forward_horizon(model_data, target, features, test_size=12, horizon=1):
+    model_data = model_data[[target] + features].dropna().copy()
+    train_size = len(model_data) - test_size
+
+    preds = []
+    pred_index = []
+
+    for i in range(train_size, len(model_data) - horizon + 1):
+        train_data = model_data.iloc[:i].copy()
+        true_date = model_data.index[i + horizon - 1]
+
+        train_features = make_ridge_train_features_horizon(
+            train_data,
+            target,
+            features,
+            horizon
+        )
+
+        if train_features.empty:
+            continue
+
+        X_train = train_features.drop(columns=[target, 'target_future'])
+        y_train = train_features['target_future']
+
+        origin_row = train_data.iloc[-1]
+        test_features = {}
+
+        for col in features:
+            test_features[col] = origin_row[col]
+
+        test_features[f'{target}_lag_1'] = train_data[target].iloc[-1]
+        test_features[f'{target}_lag_12'] = train_data[target].iloc[-12]
+
+        X_test = pd.DataFrame([test_features], index=[true_date])
+        X_test = X_test[X_train.columns]
+
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+
+        model = Ridge(alpha=1.0)
+        model.fit(X_train_scaled, y_train)
+
+        pred = model.predict(X_test_scaled)[0]
+
+        preds.append(pred)
+        pred_index.append(true_date)
+
+    return pd.Series(preds, index=pred_index)
+
+
+for data_version, data in data_versions.items():
+    print('=' * 80)
+    print(f'Прогнозы на 1-3 месяца вперед. Версия данных: {data_version}')
+    print('=' * 80)
+
+    for horizon in HORIZONS:
+        print(f'Горизонт прогноза: {horizon} мес.')
+
+        # baseline и SARIMA для всех целевых показателей
+        for target in targets:
+            series = data[target].dropna()
+
+            pred_naive = naive_horizon_forecast(
+                series,
+                test_size=MULTI_TEST_SIZE,
+                horizon=horizon
+            )
+            y_true = series.loc[pred_naive.index]
+            metrics = evaluate_model(y_true, pred_naive)
+
+            multi_horizon_results.append({
+                'target': target,
+                'model': 'naive',
+                'specification': '-',
+                'data_version': data_version,
+                'horizon': horizon,
+                **metrics
+            })
+            multi_horizon_forecasts[(target, 'naive', '-', data_version, horizon)] = pred_naive
+
+            pred_seasonal = seasonal_naive_horizon_forecast(
+                series,
+                test_size=MULTI_TEST_SIZE,
+                season=12,
+                horizon=horizon
+            )
+            y_true = series.loc[pred_seasonal.index]
+            metrics = evaluate_model(y_true, pred_seasonal)
+
+            multi_horizon_results.append({
+                'target': target,
+                'model': 'seasonal_naive',
+                'specification': '-',
+                'data_version': data_version,
+                'horizon': horizon,
+                **metrics
+            })
+            multi_horizon_forecasts[(target, 'seasonal_naive', '-', data_version, horizon)] = pred_seasonal
+
+            try:
+                pred_sarima = sarima_walk_forward_horizon(
+                    series,
+                    data_version=data_version,
+                    test_size=MULTI_TEST_SIZE,
+                    horizon=horizon
+                )
+                y_true = series.loc[pred_sarima.index]
+                metrics = evaluate_model(y_true, pred_sarima)
+
+                multi_horizon_results.append({
+                    'target': target,
+                    'model': 'SARIMA',
+                    'specification': '-',
+                    'data_version': data_version,
+                    'horizon': horizon,
+                    **metrics
+                })
+                multi_horizon_forecasts[(target, 'SARIMA', '-', data_version, horizon)] = pred_sarima
+
+            except Exception as e:
+                print(f'SARIMA ошибка: {target}, horizon={horizon}, {e}')
+
+        # VAR только для индексных рядов
+        try:
+            pred_var = var_walk_forward_horizon(
+                data,
+                var_targets,
+                test_size=MULTI_TEST_SIZE,
+                maxlags=2,
+                horizon=horizon
+            )
+
+            for target in var_targets:
+                y_true = data[target].loc[pred_var.index]
+                y_pred = pred_var[target]
+                metrics = evaluate_model(y_true, y_pred)
+
+                multi_horizon_results.append({
+                    'target': target,
+                    'model': 'VAR',
+                    'specification': '-',
+                    'data_version': data_version,
+                    'horizon': horizon,
+                    **metrics
+                })
+                multi_horizon_forecasts[(target, 'VAR', '-', data_version, horizon)] = y_pred
+
+        except Exception as e:
+            print(f'VAR ошибка: horizon={horizon}, {e}')
+
+        # Ridge для всех целевых показателей и всех спецификаций
+        for target in targets:
+            for spec_name, feature_cols in specs.items():
+                try:
+                    pred_ridge = ridge_walk_forward_horizon(
+                        data,
+                        target,
+                        feature_cols,
+                        test_size=MULTI_TEST_SIZE,
+                        horizon=horizon
+                    )
+
+                    y_true = data[target].loc[pred_ridge.index]
+                    metrics = evaluate_model(y_true, pred_ridge)
+
+                    multi_horizon_results.append({
+                        'target': target,
+                        'model': 'Ridge',
+                        'specification': spec_name,
+                        'data_version': data_version,
+                        'horizon': horizon,
+                        **metrics
+                    })
+                    multi_horizon_forecasts[(target, 'Ridge', spec_name, data_version, horizon)] = pred_ridge
+
+                except Exception as e:
+                    print(f'Ridge ошибка: {target}, {spec_name}, horizon={horizon}, {e}')
+
+
+multi_horizon_results_df = pd.DataFrame(multi_horizon_results)
+
+multi_horizon_results_df = multi_horizon_results_df[
+    [
+        'target',
+        'model',
+        'specification',
+        'data_version',
+        'horizon',
+        'MAE',
+        'RMSE',
+        'SMAPE',
+        'MedAE'
+    ]
+]
+
+multi_horizon_results_df = multi_horizon_results_df.sort_values(
+    ['data_version', 'target', 'horizon', 'RMSE']
+).reset_index(drop=True)
+
+print('Все результаты прогнозирования на горизонтах 1-3 месяца:')
+display(multi_horizon_results_df)
+
+multi_horizon_results_level = multi_horizon_results_df[
+    multi_horizon_results_df['data_version'] == 'level'
+].copy()
+
+multi_horizon_results_growth = multi_horizon_results_df[
+    multi_horizon_results_df['data_version'] == 'growth'
+].copy()
+
+print('Результаты в уровнях:')
+display(multi_horizon_results_level)
+
+print('Результаты на лог-приростах:')
+display(multi_horizon_results_growth)
+
+best_multi_horizon_level = (
+    multi_horizon_results_level
+    .sort_values(['target', 'horizon', 'RMSE'])
+    .groupby(['target', 'horizon'])
+    .head(1)
+    .reset_index(drop=True)
+)
+
+best_multi_horizon_growth = (
+    multi_horizon_results_growth
+    .sort_values(['target', 'horizon', 'RMSE'])
+    .groupby(['target', 'horizon'])
+    .head(1)
+    .reset_index(drop=True)
+)
+
+print('Лучшие модели в уровнях для каждого горизонта:')
+display(best_multi_horizon_level)
+
+print('Лучшие модели на лог-приростах для каждого горизонта:')
+display(best_multi_horizon_growth)
+
+for target in targets:
+    target_table = multi_horizon_results_level[
+        multi_horizon_results_level['target'] == target
+    ].sort_values(['horizon', 'RMSE']).reset_index(drop=True)
+
+    print(f'Таблица метрик в уровнях для {target}:')
+    display(target_table)
+
+# сохранение результатов нового блока
+os.makedirs('data', exist_ok=True)
+
+multi_horizon_results_df.to_csv(
+    'data/multi_horizon_results.csv',
+    index=False
+)
+
+multi_horizon_results_level.to_csv(
+    'data/multi_horizon_results_level.csv',
+    index=False
+)
+
+multi_horizon_results_growth.to_csv(
+    'data/multi_horizon_results_growth.csv',
+    index=False
+)
+
+best_multi_horizon_level.to_csv(
+    'data/best_multi_horizon_level.csv',
+    index=False
+)
+
+best_multi_horizon_growth.to_csv(
+    'data/best_multi_horizon_growth.csv',
+    index=False
+)
+
+multi_horizon_forecast_rows = []
+
+for key, pred in multi_horizon_forecasts.items():
+    target, model_name, specification, data_version, horizon = key
+    data = data_versions[data_version]
+    y_true = data[target].loc[pred.index]
+
+    for date in pred.index:
+        multi_horizon_forecast_rows.append({
+            'date': date,
+            'target': target,
+            'model': model_name,
+            'specification': specification,
+            'data_version': data_version,
+            'horizon': horizon,
+            'actual': y_true.loc[date],
+            'forecast': pred.loc[date],
+            'error': y_true.loc[date] - pred.loc[date],
+            'abs_error': abs(y_true.loc[date] - pred.loc[date])
+        })
+
+multi_horizon_forecasts_df = pd.DataFrame(multi_horizon_forecast_rows)
+
+multi_horizon_forecasts_df.to_csv(
+    'data/multi_horizon_forecasts.csv',
+    index=False
+)
+
+print('Файлы сохранены:')
+print('data/multi_horizon_results.csv')
+print('data/multi_horizon_results_level.csv')
+print('data/multi_horizon_results_growth.csv')
+print('data/best_multi_horizon_level.csv')
+print('data/best_multi_horizon_growth.csv')
+print('data/multi_horizon_forecasts.csv')
+
+# 24. Отдельная таблица для индекса бизнес-класса на горизонтах 1-3 месяца
+
+BUSINESS_TARGET = 'price_index_business'
+
+business_sarima_table = multi_horizon_results_level[
+    (multi_horizon_results_level['target'] == BUSINESS_TARGET)
+    & (multi_horizon_results_level['model'] == 'SARIMA')
+].copy()
+
+business_var_table = multi_horizon_results_level[
+    (multi_horizon_results_level['target'] == BUSINESS_TARGET)
+    & (multi_horizon_results_level['model'] == 'VAR')
+].copy()
+
+business_ridge_table = (
+    multi_horizon_results_level[
+        (multi_horizon_results_level['target'] == BUSINESS_TARGET)
+        & (multi_horizon_results_level['model'] == 'Ridge')
+    ]
+    .sort_values(['horizon', 'RMSE'])
+    .groupby('horizon')
+    .head(1)
+    .reset_index(drop=True)
+)
+
+business_index_horizon_table = pd.concat(
+    [
+        business_sarima_table,
+        business_var_table,
+        business_ridge_table
+    ],
+    ignore_index=True
+)
+
+business_index_horizon_table = business_index_horizon_table[
+    [
+        'target',
+        'model',
+        'specification',
+        'horizon',
+        'MAE',
+        'RMSE',
+        'SMAPE',
+        'MedAE'
+    ]
+].sort_values(['horizon', 'model']).reset_index(drop=True)
+
+print('Таблица метрик для индекса бизнес-класса на горизонтах 1-3 месяца:')
+display(business_index_horizon_table)
+
+business_index_horizon_table.to_csv(
+    'data/business_index_horizon_table.csv',
+    index=False
+)
+
+print('Файл сохранен: data/business_index_horizon_table.csv')
+
+# Таблица средних метрик по горизонтам 1–3 месяца
+# Только SARIMA, VAR и Ridge
+
+table_avg_metrics = multi_horizon_results_level.copy()
+
+# Оставляем только основные модели
+table_avg_metrics = table_avg_metrics[
+    table_avg_metrics['model'].isin(['SARIMA', 'VAR', 'Ridge'])
+].copy()
+
+# Считаем средние значения метрик по горизонтам
+table_avg_metrics = (
+    table_avg_metrics
+    .groupby(
+        ['target', 'model', 'specification'],
+        as_index=False
+    )
+    [['MAE', 'RMSE', 'SMAPE', 'MedAE']]
+    .mean()
+)
+
+# Сортируем по целевому показателю и RMSE
+table_avg_metrics = table_avg_metrics.sort_values(
+    ['target', 'RMSE']
+).reset_index(drop=True)
+
+# Красивые названия целевых показателей
+target_names = {
+    'price_sqm': 'Средняя стоимость 1 кв. м.',
+    'price_index_economy': 'Индекс эконом/комфорт-класса',
+    'price_index_business': 'Индекс бизнес-класса'
+}
+
+table_avg_metrics['target'] = table_avg_metrics['target'].map(target_names)
+
+# Заполняем спецификацию
+table_avg_metrics['specification'] = (
+    table_avg_metrics['specification']
+    .fillna('-')
+    .replace('', '-')
+)
+
+# Округление
+for col in ['MAE', 'RMSE', 'SMAPE', 'MedAE']:
+    table_avg_metrics[col] = table_avg_metrics[col].round(2)
+
+# Переименование столбцов
+table_avg_metrics = table_avg_metrics.rename(columns={
+    'target': 'Целевой показатель',
+    'model': 'Модель',
+    'specification': 'Спецификация'
+})
+
+table_avg_metrics
+
+# таблица качества baseline-моделей
+
+TEST_SIZE = 12
+
+baseline_results = []
+baseline_horizon_results = []
+
+for target in targets:
+    series = df_level[target].dropna()
+
+    for model_name, model_func in baseline_models.items():
+        avg_metrics, horizon_forecasts = evaluate_baseline_model(
+            series=series,
+            model_func=model_func,
+            test_size=TEST_SIZE,
+            horizons=[1, 2, 3]
+        )
+
+        baseline_results.append({
+            'target': target,
+            'model': model_name,
+            **avg_metrics
+        })
+
+        for horizon, pred in horizon_forecasts.items():
+            y_true = series.loc[pred.index]
+            metrics = evaluate_model(y_true, pred)
+
+            baseline_horizon_results.append({
+                'target': target,
+                'model': model_name,
+                'horizon': horizon,
+                **metrics
+            })
+
+baseline_results_df = pd.DataFrame(baseline_results)
+
+baseline_results_df = baseline_results_df[
+    [
+        'target',
+        'model',
+        'MAE',
+        'RMSE',
+        'SMAPE',
+        'MedAE'
+    ]
+]
+
+baseline_results_df = baseline_results_df.sort_values(
+    ['target', 'RMSE']
+).reset_index(drop=True)
+
+baseline_horizon_results_df = pd.DataFrame(baseline_horizon_results)
+
+baseline_horizon_results_df = baseline_horizon_results_df[
+    [
+        'target',
+        'model',
+        'horizon',
+        'MAE',
+        'RMSE',
+        'SMAPE',
+        'MedAE'
+    ]
+]
+
+baseline_horizon_results_df = baseline_horizon_results_df.sort_values(
+    ['target', 'model', 'horizon']
+).reset_index(drop=True)
+
+metric_cols = ['MAE', 'RMSE', 'SMAPE', 'MedAE']
+
+baseline_results_show = baseline_results_df.copy()
+baseline_horizon_results_show = baseline_horizon_results_df.copy()
+
+for col in metric_cols:
+    baseline_results_show[col] = (
+        baseline_results_show[col]
+        .round(2)
+        .astype(str)
+        .str.replace('.', ',', regex=False)
+    )
+
+    baseline_horizon_results_show[col] = (
+        baseline_horizon_results_show[col]
+        .round(2)
+        .astype(str)
+        .str.replace('.', ',', regex=False)
+    )
+
+display(baseline_results_show)
+display(baseline_horizon_results_show)
+
+
+
